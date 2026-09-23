@@ -76,3 +76,50 @@ def brute_solve(n, arcs):
         "classification": classification,
         "usage": usage,
     }
+
+
+def brute_counterfactual(n, arcs, target, mode):
+    """暴力枚举单条候选在 disabled / forced 约束下的最优结果。
+
+    返回 (max_pairs, min_cost, optimal_count, canonical_id_sequence)。
+    """
+
+    cost = {cid: r for cid, _a, _b, r in arcs}
+    left_of = {cid: a for cid, a, _b, _r in arcs}
+
+    # 重新枚举一次以拿到原始匹配集合（brute_solve 不返回匹配本体）。
+    by_left = [[] for _ in range(n)]
+    for cid, a, b, r in arcs:
+        by_left[a].append((b, r, cid))
+    sols = [[[] for _ in range(n + 1)] for _ in range(n + 1)]
+    for i in range(n + 1):
+        sols[i][i] = [frozenset()]
+    for length in range(1, n + 1):
+        for i in range(0, n - length + 1):
+            j = i + length
+            out = set(sols[i + 1][j])
+            for b, _r, cid in by_left[i]:
+                if b >= j:
+                    continue
+                for inner in sols[i + 1][b]:
+                    for outer in sols[b + 1][j]:
+                        out.add(frozenset({cid}) | inner | outer)
+            sols[i][j] = list(out)
+
+    if mode == "disabled":
+        feasible = [m for m in sols[0][n] if target not in m]
+    else:
+        feasible = [m for m in sols[0][n] if target in m]
+
+    max_pairs = max(len(m) for m in feasible)
+    min_cost = min(
+        sum(cost[c] for c in m) for m in feasible if len(m) == max_pairs
+    )
+    optimal = [
+        m for m in feasible if len(m) == max_pairs and sum(cost[c] for c in m) == min_cost
+    ]
+    canonical = min(
+        (sorted(m, key=lambda c: (left_of[c], c)) for m in optimal),
+        key=list,
+    )
+    return max_pairs, min_cost, len(optimal), canonical

@@ -3,7 +3,8 @@
 依次执行：
 1. 代码测试（pytest 单元测试，含随机暴力交叉验证）；
 2. 构建检查（语法编译、模块导入、镜像内关键文件齐备）；
-3. API/HTTP 冒烟（健康路径 + 嵌套同优、交叉低价诱饵、空候选、非法引用四类场景）。
+3. API/HTTP 冒烟（健康路径 + 嵌套同优、交叉低价诱饵、空候选、非法引用，
+   以及敏感度的必选弧禁用退化、交叉诱饵强制见证、空剖面、旧审计回归）。
 
 任一步失败即以非零退出码结束，全部通过退出码 0。
 """
@@ -211,6 +212,134 @@ def run_smoke() -> None:
     # 未知路径返回 404。
     status, _ = http_request("GET", "/nope")
     check(status == 404, "未知路径返回 404", f"HTTP {status}")
+
+    # ---------- 敏感度：必选弧禁用后的退化 ----------
+    # must=(0,4) 是达到 2 对的唯一外层结构；禁用后只能 1 对，强制则 2 对。
+    payload = {
+        "hits": hits(5),
+        "candidates": [
+            cand("must", 0, 4, 0),
+            cand("mid", 1, 3, 0),
+            cand("only_other", 2, 3, 5),
+        ],
+    }
+    status, body = http_request("POST", "/sensitivity", payload)
+    prof = {p["id"]: p for p in body.get("profiles", [])}
+    ok = (
+        status == 200
+        and prof["must"]["disabled"]["paired_hits"] == 2
+        and prof["must"]["forced"]["paired_hits"] == 4
+        and prof["mid"]["forced"]["paired_hits"] == 4
+    )
+    check(ok, "必选弧禁用后退化、强制保持最优", f"HTTP {status} {body}")
+
+    # 同一数据的审计回归：旧字段、旧语义不变。
+    status_audit, body_audit = http_request("POST", "/audit", payload)
+    ok_audit = (
+        status_audit == 200
+        and body_audit["optimal_count"] == "1"
+        and [p["id"] for p in body_audit["canonical_pairs"]] == ["must", "mid"]
+        and body_audit["classification"]["required"] == ["mid", "must"]
+    )
+    check(ok_audit, "旧审计回归（规范解与分类不变）", f"HTTP {status_audit} {body_audit}")
+
+    # ---------- 敏感度：交叉诱饵强制后的最优见证 ----------
+    payload = {
+        "hits": hits(6),
+        "candidates": [
+            cand("bait", 0, 3, 0),
+            cand("inner", 1, 2, 10),
+            cand("tail", 4, 5, 1),
+            cand("seq01", 0, 1, 1),
+            cand("seq23", 2, 3, 1),
+        ],
+    }
+    status, forced_body = http_request(
+        "POST",
+        "/sensitivity/witness",
+        {**payload, "candidate": "bait", "mode": "forced"},
+    )
+    ok = (
+        status == 200
+        and [p["id"] for p in forced_body.get("canonical_pairs", [])]
+        == ["bait", "inner", "tail"]
+        and forced_body.get("total_residual") == 11
+        and forced_body.get("unmatched_hits") == []
+        and forced_body.get("optimal_count") == "1"
+    )
+    check(ok, "交叉诱饵强制后的最优见证", f"HTTP {status} {forced_body}")
+
+    # 禁用模式的见证同样可用，并给出未配对击中。
+    status, body = http_request(
+        "POST",
+        "/sensitivity/witness",
+        {**payload, "candidate": "bait", "mode": "disabled"},
+    )
+    ok = (
+        status == 200
+        and [p["id"] for p in body.get("canonical_pairs", [])] == ["seq01", "seq23", "tail"]
+        and body.get("unmatched_hits") == []
+    )
+    check(ok, "禁用见证回落到无诱饵最优", f"HTTP {status} {body}")
+
+    # 见证三元组必须与批量剖面一致。
+    status, prof_body = http_request("POST", "/sensitivity", payload)
+    bait_prof = next(p for p in prof_body["profiles"] if p["id"] == "bait")
+    check(
+        status == 200
+        and bait_prof["forced"]["optimal_count"] == forced_body["optimal_count"]
+        and bait_prof["forced"]["paired_hits"] == forced_body["paired_hits"]
+        and bait_prof["forced"]["total_residual"] == forced_body["total_residual"],
+        "批量剖面与见证三元组一致",
+        f"{bait_prof} vs {forced_body}",
+    )
+
+    # ---------- 敏感度：空剖面 ----------
+    status, body = http_request(
+        "POST", "/sensitivity", {"hits": hits(4), "candidates": []}
+    )
+    check(
+        status == 200 and body == {"profiles": []},
+        "空候选返回空剖面",
+        f"HTTP {status} {body}",
+    )
+
+    # ---------- 敏感度：非法引用只返回字段路径错误 ----------
+    bad = {"hits": hits(4), "candidates": [cand("bad", 0, 99, 0)]}
+    bad["candidates"][0]["right_endpoint"] = "h99"
+    status, body = http_request("POST", "/sensitivity", bad)
+    check(
+        status == 400
+        and any(e.get("field") == "/candidates/0/right_endpoint" for e in body.get("errors", []))
+        and set(body.keys()) == {"errors"},
+        "敏感度非法引用只返回字段路径错误",
+        f"HTTP {status} {body}",
+    )
+
+    status, body = http_request(
+        "POST",
+        "/sensitivity/witness",
+        {**bad, "candidate": "bad", "mode": "forced"},
+    )
+    check(
+        status == 400
+        and any(e.get("field") == "/candidates/0/right_endpoint" for e in body.get("errors", []))
+        and "canonical_pairs" not in body,
+        "见证非法引用不夹带见证字段",
+        f"HTTP {status} {body}",
+    )
+
+    status, body = http_request(
+        "POST",
+        "/sensitivity/witness",
+        {"hits": hits(4), "candidates": [], "candidate": "ghost", "mode": "forced"},
+    )
+    check(
+        status == 400
+        and any(e.get("field") == "/candidate" for e in body.get("errors", [])),
+        "未知候选标识返回 /candidate 错误",
+        f"HTTP {status} {body}",
+    )
 
 
 def main() -> int:
