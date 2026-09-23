@@ -83,3 +83,119 @@ def test_bad_json(server):
 def test_unknown_route(server):
     status, _ = request(server, "GET", "/")
     assert status == 404
+
+
+def base_payload():
+    return {
+        "hits": [{"id": f"h{k}", "position": k * 10} for k in range(6)],
+        "candidates": [
+            {"id": "bait", "left_endpoint": "h0", "right_endpoint": "h3", "residual": 0},
+            {"id": "inner", "left_endpoint": "h1", "right_endpoint": "h2", "residual": 10},
+            {"id": "tail", "left_endpoint": "h4", "right_endpoint": "h5", "residual": 1},
+            {"id": "seq01", "left_endpoint": "h0", "right_endpoint": "h1", "residual": 1},
+            {"id": "seq23", "left_endpoint": "h2", "right_endpoint": "h3", "residual": 1},
+        ],
+    }
+
+
+def test_sensitivity_ok(server):
+    status, body = request(server, "POST", "/sensitivity", base_payload())
+    assert status == 200
+    profiles = {p["id"]: p for p in body["profiles"]}
+    assert set(profiles) == {"bait", "inner", "tail", "seq01", "seq23"}
+    # 必选弧 seq01 禁用后由嵌套方案顶上（仍 6 个配对点，残差升到 11）；
+    # 诱饵强制后 bait+inner+tail 嵌套同选，也是 6 个配对点。
+    assert profiles["seq01"]["disabled"] == {
+        "paired_hits": 6,
+        "total_residual": 11,
+        "optimal_count": "1",
+    }
+    assert profiles["bait"]["forced"] == {
+        "paired_hits": 6,
+        "total_residual": 11,
+        "optimal_count": "1",
+    }
+    # 大整数仍以字符串承载。
+    assert isinstance(profiles["bait"]["forced"]["optimal_count"], str)
+
+
+def test_sensitivity_empty_profiles(server):
+    payload = {"hits": base_payload()["hits"], "candidates": []}
+    status, body = request(server, "POST", "/sensitivity", payload)
+    assert status == 200 and body == {"profiles": []}
+
+
+def test_sensitivity_error_shape(server):
+    payload = {
+        "hits": [{"id": f"h{k}", "position": k * 10} for k in range(4)],
+        "candidates": [
+            {"id": "x", "left_endpoint": "h0", "right_endpoint": "nope", "residual": 0}
+        ],
+    }
+    status, body = request(server, "POST", "/sensitivity", payload)
+    assert status == 400
+    assert set(body.keys()) == {"errors"}
+    assert body["errors"][0]["field"] == "/candidates/0/right_endpoint"
+
+
+def test_witness_ok_forced_bait(server):
+    status, body = request(
+        server,
+        "POST",
+        "/sensitivity/witness",
+        {**base_payload(), "target": "bait", "mode": "forced"},
+    )
+    assert status == 200
+    assert [p["id"] for p in body["canonical_pairs"]] == ["bait", "inner", "tail"]
+    assert body["unmatched_hits"] == []
+    assert body["optimal_count"] == "1"
+    assert body["target"] == "bait" and body["mode"] == "forced"
+
+
+def test_witness_ok_disabled(server):
+    status, body = request(
+        server,
+        "POST",
+        "/sensitivity/witness",
+        {**base_payload(), "target": "tail", "mode": "disabled"},
+    )
+    assert status == 200
+    assert "tail" not in [p["id"] for p in body["canonical_pairs"]]
+    assert set(body["unmatched_hits"]) == {"h4", "h5"}
+
+
+def test_witness_illegal_target_field_path_only(server):
+    status, body = request(
+        server,
+        "POST",
+        "/sensitivity/witness",
+        {**base_payload(), "target": "ghost", "mode": "forced"},
+    )
+    assert status == 400
+    assert set(body.keys()) == {"errors"}
+    assert any(e["field"] == "/target" for e in body["errors"])
+
+    status, body = request(
+        server,
+        "POST",
+        "/sensitivity/witness",
+        {**base_payload(), "target": "bait", "mode": "weird"},
+    )
+    assert status == 400
+    assert any(e["field"] == "/mode" for e in body["errors"])
+    assert "canonical_pairs" not in body
+
+
+def test_witness_data_error_still_field_path(server):
+    payload = {
+        "hits": [{"id": f"h{k}", "position": k * 10} for k in range(4)],
+        "candidates": [
+            {"id": "x", "left_endpoint": "h0", "right_endpoint": "zz", "residual": 0}
+        ],
+        "target": "x",
+        "mode": "forced",
+    }
+    status, body = request(server, "POST", "/sensitivity/witness", payload)
+    assert status == 400
+    assert any(e["field"] == "/candidates/0/right_endpoint" for e in body["errors"])
+    assert all(e["field"] != "/target" for e in body["errors"])

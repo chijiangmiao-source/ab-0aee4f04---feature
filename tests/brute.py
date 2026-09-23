@@ -6,7 +6,10 @@
 from __future__ import annotations
 
 
-def brute_solve(n, arcs):
+def brute_solve(n, arcs, force=(), forbid=()):
+    """枚举全部非交叉匹配；force 中的弧必须选用、forbid 中的弧必须禁用。"""
+    force = set(force)
+    forbid = set(forbid)
     by_left = [[] for _ in range(n)]
     for cid, a, b, r in arcs:
         by_left[a].append((b, r, cid))
@@ -32,6 +35,10 @@ def brute_solve(n, arcs):
     left_of = {cid: a for cid, a, _b, _r in arcs}
     scored = []
     for matching in sols[0][n]:
+        if force and not force.issubset(matching):
+            continue
+        if forbid and forbid.intersection(matching):
+            continue
         scored.append((matching, len(matching), sum(cost[c] for c in matching)))
 
     max_pairs = max(p for _m, p, _c in scored)

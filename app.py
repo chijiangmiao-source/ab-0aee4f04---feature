@@ -1,8 +1,11 @@
 """硅微条击中配对审计 HTTP 服务（仅依赖 Python 标准库）。
 
 路由：
-* GET  /health   就绪探针；
-* POST /audit    提交 {hits, candidates}，返回配对审计结果。
+* GET  /health               就绪探针；
+* POST /audit                提交 {hits, candidates}，返回配对审计结果；
+* POST /sensitivity          同审计数据，返回每条候选禁用/强制剖面；
+* POST /sensitivity/witness  {hits, candidates, target, mode}，
+                              返回约束后的规范配对与未配对击中。
 
 错误响应只包含 errors（每条带字段路径 field 与 message），不夹带任何审计字段。
 监听端口由环境变量 PORT 控制（默认 8080）。
@@ -15,10 +18,17 @@ import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from solver import ValidationError, audit
+from solver import ValidationError, audit, sensitivity, sensitivity_witness
 
 SERVICE_NAME = "track-pair-audit"
 MAX_BODY_BYTES = 8 * 1024 * 1024
+
+# 路径 -> 求解入口。各入口自行校验并在非法时抛 ValidationError。
+POST_ROUTES = {
+    "/audit": audit,
+    "/sensitivity": sensitivity,
+    "/sensitivity/witness": sensitivity_witness,
+}
 
 
 class AuditHandler(BaseHTTPRequestHandler):
@@ -45,7 +55,9 @@ class AuditHandler(BaseHTTPRequestHandler):
         )
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path.split("?")[0] != "/audit":
+        path = self.path.split("?")[0]
+        solve = POST_ROUTES.get(path)
+        if solve is None:
             self._write_json(
                 HTTPStatus.NOT_FOUND,
                 {"errors": [{"field": "", "message": f"未知路径: {self.path}"}]},
@@ -78,7 +90,7 @@ class AuditHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = audit(payload)
+            result = solve(payload)
         except ValidationError as exc:
             # 错误响应不夹带任何审计结果。
             self._write_json(HTTPStatus.BAD_REQUEST, {"errors": exc.errors})
